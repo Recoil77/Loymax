@@ -1,0 +1,335 @@
+import os
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from dotenv import load_dotenv
+import openai
+import json
+import asyncio
+import torch
+from concurrent.futures import ThreadPoolExecutor
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
+load_dotenv()
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+app = FastAPI()
+client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+class EmbeddingTextRequest(BaseModel):
+    text: str
+
+class EmbeddingTextResponse(BaseModel):
+    embedding_text: str
+
+# ---------------------------------------------------------------------------
+# Deterministic normalisation prompt
+# ---------------------------------------------------------------------------
+PROMPT = """
+You are a professional, literal English translator and text normaliser.
+
+Your task: Given any text in any language, output an English version that is as precise and faithful as possible, with no additions, omissions, or stylistic rephrasing.
+
+**Rules:**
+1. Always translate the input into clear, natural, literal English. Do not paraphrase or summarize.
+2. Retain all original facts, names, numbers, dates, and word order wherever possible.
+3. Remove markdown, HTML, links, and all special formatting. Output only plain English text.
+4. Do not add explanations, synonyms, or extra commentary.
+5. Output pure UTF-8 English text, with single spaces between words and no leading or trailing spaces or newlines.
+6. If the input is already in English, simply clean it up as above, but do not change any meaning.
+
+**Respond only as a JSON object in this format:**
+{{"embedding_text": "<the precise English translation here>"}}
+
+Text to translate and normalise (between the lines):
+----------------------------------------
+{input_text}
+----------------------------------------
+"""
+
+
+# ---------------------------------------------------------------------------
+# Endpoint
+# ---------------------------------------------------------------------------
+@app.post("/embedding_text", response_model=EmbeddingTextResponse)
+async def embedding_text_endpoint(req: EmbeddingTextRequest):
+    """Normalise input text for stable embeddings."""
+    try:
+       
+
+        chat_response = await client.chat.completions.create(
+            model="gpt-4.1-2025-04-14",  # ↔ use your preferred deterministic model ID
+            messages=[
+                {"role": "system", "content": "You are an expert English normaliser for embeddings."},
+                {"role": "user", "content": PROMPT.format(input_text=req.text)},
+            ],
+            max_tokens=2048,
+            temperature=0.0,  # ← remove stochasticity
+            top_p=0.0,        # ← even stricter determinism
+            response_format={"type": "json_object"},
+        )
+        result = chat_response.choices[0].message.content
+        result_json = json.loads(result)
+        return EmbeddingTextResponse(**result_json)
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+class EmbeddingRequest(BaseModel):
+    text: str
+
+class EmbeddingResponse(BaseModel):
+    embedding: list
+
+@app.post("/embedding", response_model=EmbeddingResponse)
+async def embedding_endpoint(req: EmbeddingRequest):
+    try:
+        response = await openai.AsyncOpenAI().embeddings.create(
+            model="text-embedding-3-large",  # или твоя модель
+            input=req.text
+        )
+        embedding = response.data[0].embedding
+        return EmbeddingResponse(embedding=embedding)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+from typing import List
+
+
+def _add_prefixes(query: str, docs: List[str]) -> tuple[str, List[str]]:
+    """Return query/document strings with the prefixes expected by BGE‑reranker."""
+    q_prefixed = f"query: {query}"
+    d_prefixed = [f"passage:: {t}" for t in docs]
+    return q_prefixed, d_prefixed
+
+# --------------------------------------------------------------------------------------
+# Re‑ranker class
+# --------------------------------------------------------------------------------------
+
+class BGERerankFunction:
+    def __init__(self, model_name: str = "BAAI/bge-reranker-base") -> None:
+        # Dynamic device selection
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name)
+        self.model.to(self.device)
+        self.model.eval()
+        # Thread pool for parallel batch processing
+        self.executor = ThreadPoolExecutor()
+
+    # ------------------------------------------------------------------
+    # Internal helpers
+    # ------------------------------------------------------------------
+
+    def _score_batch(self, query: str, docs: List[str]) -> List[float]:
+        """Tokenize & infer a batch → return *logits* (no sigmoid)."""
+        # 1) Prefixes
+        q, d = _add_prefixes(query, docs)
+        # 2) Tokenize — truncate *only second* sequence
+        inputs = self.tokenizer(
+            [q] * len(d),
+            d,
+            padding=True,
+            truncation="only_second",
+            max_length=512,
+            return_tensors="pt",
+        ).to(self.device)
+        # 3) Forward pass
+        with torch.inference_mode():
+            logits = self.model(**inputs).logits.squeeze(-1)
+        return logits.float().cpu().tolist()
+
+    # ------------------------------------------------------------------
+    # Public async callable
+    # ------------------------------------------------------------------
+
+    async def __call__(
+        self, query: str, docs: List[str], batch_size: int = 8
+    ) -> List[float]:
+        tasks = []
+        loop = asyncio.get_running_loop()
+        for i in range(0, len(docs), batch_size):
+            batch = docs[i : i + batch_size]
+            tasks.append(
+                loop.run_in_executor(self.executor, self._score_batch, query, batch)
+            )
+        # Gather & flatten
+        results = await asyncio.gather(*tasks)
+        scores = [s for batch in results for s in batch]
+        return scores
+
+# Singleton instance
+ger_reranker = BGERerankFunction()
+
+# --------------------------------------------------------------------------------------
+# Pydantic models
+# --------------------------------------------------------------------------------------
+
+class RerankRequest(BaseModel):
+    question: str
+    answers: List[str]
+    threshold: float = 0.0  # сырые logits > 0 ≈ «скорее релевантно»
+
+class RerankResult(BaseModel):
+    index: int
+    score: float
+    text: str
+
+# --------------------------------------------------------------------------------------
+# FastAPI endpoint
+# --------------------------------------------------------------------------------------
+
+@app.post("/rerank_bge", response_model=dict)
+async def rerank_bge_endpoint(req: RerankRequest):
+    try:
+        # 1) Получаем оценки (logits)
+        scores = await ger_reranker(req.question, req.answers)
+
+        # 2) Фильтруем по порогу и собираем результаты
+        filtered = [
+            RerankResult(index=i, score=score, text=req.answers[i])
+            for i, score in enumerate(scores)
+            if score >= req.threshold
+        ]
+        # 3) Сортируем по убыванию
+        sorted_results = sorted(filtered, key=lambda r: r.score, reverse=True)
+        return {"results": [r.dict() for r in sorted_results]}
+
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=str(exc))
+
+
+
+
+class RerankBlockCandidate(BaseModel):
+    block_id: int
+    text: str
+
+class RerankSemanticV5Request(BaseModel):
+    question: str
+    candidates: list[RerankBlockCandidate]
+    threshold: float = 0.25
+
+class RerankBlockCandidate(BaseModel):
+    block_id: int
+    text: str
+
+
+class RerankMinimalResult(BaseModel):
+    block_id: int
+    score: float
+
+
+# Configuration
+MAX_CONCURRENT_RERANK = 8
+semaphore = asyncio.Semaphore(MAX_CONCURRENT_RERANK)
+
+def make_system_prompt(threshold: float) -> str:
+    return (
+        "You are a semantic relevance assistant.\n"
+        "Your task is to evaluate how well a candidate text fragment answers or supports the given user question.\n"
+        "Return a JSON object with a single field 'score' between 0.0 and 1.0.\n"
+        "If the score is below the threshold (" + str(threshold) + "), return exactly {\"score\": 0.0}.\n"
+        "Do not include explanations or extra fields."
+    )
+
+RERANKER_USER_PROMPT = (
+    "Question:\n{question}\n\n"
+    "Candidate Text:\n{candidate_text}"
+)
+
+
+@app.post("/rerank_semantic", response_model=list[RerankMinimalResult])
+async def rerank_semantic_v5(request: RerankSemanticV5Request):
+    system_prompt = make_system_prompt(request.threshold)
+
+    async def score_candidate(candidate: RerankBlockCandidate) -> dict:
+        user_prompt = RERANKER_USER_PROMPT.format(
+            question=request.question,
+            candidate_text=candidate.text
+        )
+        try:
+            async with semaphore:
+                response = await client.chat.completions.create(
+                    model="gpt-4.1-2025-04-14",
+                    messages=[
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_prompt}
+                    ],
+                    temperature=0
+                )
+            content = response.choices[0].message.content.strip()
+            parsed = json.loads(content)
+            score = float(parsed.get("score", 0.0))
+            if not (0.0 <= score <= 1.0):
+                score = 0.0
+        except Exception as e:
+            print(f"❌ Error scoring block {candidate.block_id}: {e}")
+            score = 0.0
+        return {"block_id": candidate.block_id, "score": score}
+
+    # Score all candidates with concurrency control
+    results = await asyncio.gather(*(score_candidate(c) for c in request.candidates))
+    # Filter and sort
+    filtered = [r for r in results if r["score"] >= request.threshold]
+    sorted_results = sorted(filtered, key=lambda r: r["score"], reverse=True)
+    return sorted_results
+
+
+ASSEMBLE_DOCUMENT_PROMPT = """You are an assistant that assembles a relevant document from a list of text fragments (chunks).
+
+Your task:
+- Focus strictly on the provided question.
+- Use only the information contained in the provided chunks.
+- Remove duplicates and repeated ideas.
+- Merge overlapping or similar content into a single clear explanation.
+- Do not invent new facts or add external knowledge.
+- Do not copy sentences verbatim multiple times — if similar sentences appear in several chunks, summarize or rephrase to avoid repetition.
+
+Write clearly, concisely, and naturally.
+
+Structure:
+- Start with the key information that directly answers the question.
+- Follow with supporting details, logically grouped.
+- If the information includes examples, lists, or structured data (such as prices, terms, names, dates, times or timelines), preserve these formats.
+- Do not add extra headings or formatting unless explicitly present in the chunks.
+
+Your output must be the assembled document text only. Do not include comments or explanations about your process.
+Return your answer as a valid JSON object with key "assembled_document".
+""".strip()
+
+class AssembleDocumentRequest(BaseModel):
+    question: str
+    chunks: list[str]
+
+class AssembleDocumentResponse(BaseModel):
+    assembled_document: str
+
+
+
+@app.post("/assemble_document", response_model=AssembleDocumentResponse)
+async def assemble_document(request: AssembleDocumentRequest):
+    
+
+    user_prompt = f"""User Question:\n{request.question}\n\nRetrieved Chunks:\n""" + \
+                  "\n".join([f"{idx+1}. {chunk}" for idx, chunk in enumerate(request.chunks)])
+
+    messages = [
+        {"role": "system", "content": ASSEMBLE_DOCUMENT_PROMPT.strip()},
+        {"role": "user", "content": user_prompt}
+    ]
+
+    try:
+        response = await client.chat.completions.create(
+            model="gpt-4.1-2025-04-14", #   "o3-mini-2025-01-31" "o3-2025-04-16"   "gpt-4.1-nano-2025-04-14" "gpt-4.1-mini-2025-04-14" 
+            messages=messages,
+            temperature=0.2,
+        )
+        result = json.loads(response.choices[0].message.content)
+        return  result
+
+    except Exception as e:
+        return {"assembled_document": f"Error: {str(e)}"}
