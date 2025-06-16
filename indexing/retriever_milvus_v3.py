@@ -103,7 +103,7 @@ async def main(query: str, k: int):
     hits, candidates = search_milvus(vec, k)
     print(f"\n[step] TOP-{k} Кандидатов из Milvus (embedding_text):")
     for i, c in enumerate(candidates):
-        print(f"[{i}] {c['embedding_text'][:150]} ...\n")
+        print(f"[{i}] {c['embedding_text'][:150]} ...")
 
     # 4. BGE rerank по embedding_text
     bge_result = await rerank_bge(query_embedding_text, [c["embedding_text"] for c in candidates], threshold=-5)
@@ -139,6 +139,6 @@ async def main(query: str, k: int):
 
 if __name__ == "__main__":
     import sys
-    q = sys.argv[1] if len(sys.argv) > 1 else "1964 — Владимир Федотов (16)."
+    q = sys.argv[1] if len(sys.argv) > 1 else "В каком году Виктор Тихонов предпринял первые шаги к объединению двух клубов ?"
     k = int(sys.argv[2]) if len(sys.argv) > 2 else 8
     asyncio.run(main(q, k))

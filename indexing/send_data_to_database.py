@@ -1,11 +1,12 @@
 """
-Bulk-индексация для Milvus Standalone (pymilvus, асинхронные эмбеддинги)
-Версия v3.0 — переработана логика:
-  • убрана предварительная проверка uid_exists(); полагаемся на уникальность PK
-  • вставка в Milvus выполняется батчами (BATCH_SIZE, по умолчанию 512)
-  • дубли PK ловятся через pymilvus.exceptions.InsertException
-  •Consitency level по умолчанию (Bounded для Standalone)
-  • nprobe=8 для IVF_FLAT (быстрее при малой коллекции)
+# bulk_index_milvus_multi.py — многопоточный (8 параллельных задач) индексатор для Milvus
+# -----------------------------------------------------------------------------
+# Ключевые отличия от однопоточной версии:
+#   • Параллельность управляется asyncio-семафором (MAX_CONCURRENCY = 8).
+#   • Блокирующие операции Milvus выполняются в ThreadPoolExecutor (run_in_executor).
+#   • aiohttp TCPConnector(limit=MAX_CONCURRENCY) − до 8 одновременных HTTP-запросов.
+#   • tqdm-прогресс создаётся один раз и закрывается по завершении (без async-контекста).
+# -----------------------------------------------------------------------------
 """
 
 import os
@@ -13,8 +14,12 @@ import asyncio
 import aiofiles
 import json
 from pathlib import Path
+from functools import partial
+from typing import Any
 from dotenv import load_dotenv
 import aiohttp
+import numpy as np
+from tqdm import tqdm
 from pymilvus import (
     connections,
     Collection,
@@ -22,34 +27,27 @@ from pymilvus import (
     CollectionSchema,
     DataType,
     list_collections,
-    exceptions as milvus_exc,
 )
-from tqdm import tqdm
-import numpy as np
 
-# ─────────────────────────── Настройки ────────────────────────────
+# ─────────────────────── Настройки ───────────────────────
 load_dotenv()
+EMBEDDING_TEXT_URL     = os.getenv("EMBEDDING_TEXT_URL", "http://192.168.168.10:8500/embedding_text")
+EMBEDDING_URL          = os.getenv("EMBEDDING_URL",      "http://192.168.168.10:8500/embedding")
+INPUT_PATH             = Path(os.getenv("INPUT_PATH",    "data/RuBQ_2.0_paragraphs.json"))
+MILVUS_HOST            = os.getenv("MILVUS_HOST",        "192.168.168.11")
+MILVUS_PORT            = os.getenv("MILVUS_PORT",        "19530")
+COLLECTION_NAME        = os.getenv("COLLECTION_NAME",    "wiki_paragraphs")
+LOG_DUPLICATES         = os.getenv("LOG_DUPLICATES",     "index_duplicates.log")
+SIMILARITY_THRESHOLD   = float(os.getenv("SIMILARITY_THRESHOLD", 0.02))
+EMBEDDING_DIM          = int(os.getenv("EMBEDDING_DIM", 3072))
+MIN_TEXT_LENGTH        = int(os.getenv("MIN_TEXT_LENGTH", 20))
+MAX_RETRIES            = int(os.getenv("MAX_RETRIES", 3))
+BASE_TIMEOUT_SEC       = int(os.getenv("BASE_TIMEOUT_SEC", 30))
+MAX_CONCURRENCY        = 16  # ← главная настройка параллельности
 
-EMBEDDING_TEXT_URL = os.getenv("EMBEDDING_TEXT_URL", "http://192.168.168.10:8500/embedding_text")
-EMBEDDING_URL      = os.getenv("EMBEDDING_URL",      "http://192.168.168.10:8500/embedding")
-INPUT_PATH         = Path(os.getenv("INPUT_PATH",     "data/RuBQ_2.0_paragraphs.json"))
-MILVUS_HOST        = os.getenv("MILVUS_HOST",        "192.168.168.11")
-MILVUS_PORT        = os.getenv("MILVUS_PORT",        "19530")
-COLLECTION_NAME    = os.getenv("COLLECTION_NAME",    "wiki_paragraphs")
-LOG_DUPLICATES     = os.getenv("LOG_DUPLICATES",     "index_duplicates.log")
-SIMILARITY_THRESHOLD = float(os.getenv("SIMILARITY_THRESHOLD", 0.02))  # не используется в этой версии
-EMBEDDING_DIM      = int(os.getenv("EMBEDDING_DIM", 3072))
-
-MIN_TEXT_LENGTH  = int(os.getenv("MIN_TEXT_LENGTH", 20))
-MAX_CONCURRENT   = int(os.getenv("MAX_CONCURRENT", 8))
-MAX_RETRIES      = int(os.getenv("MAX_RETRIES", 3))
-BASE_TIMEOUT_SEC = int(os.getenv("BASE_TIMEOUT_SEC", 30))
-BATCH_SIZE       = int(os.getenv("BATCH_SIZE", 1))
-
-# ─────────────────────── Milvus: коллекция ────────────────────────
+# ─────────────────────── Milvus helpers ───────────────────────
 
 def get_or_create_collection() -> Collection:
-    """Создаёт (или открывает) коллекцию с нужными полями и индексом."""
     connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
 
     if COLLECTION_NAME in list_collections():
@@ -58,13 +56,12 @@ def get_or_create_collection() -> Collection:
         fields = [
             FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
             FieldSchema(name="ru_wiki_pageid", dtype=DataType.INT64),
-            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=16384),
-            FieldSchema(name="embedding_text", dtype=DataType.VARCHAR, max_length=16384),
+            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=8192 * 2),
+            FieldSchema(name="embedding_text", dtype=DataType.VARCHAR, max_length=8192 * 2),
             FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM),
         ]
         collection = Collection(COLLECTION_NAME, CollectionSchema(fields, "Wiki paragraphs (ru)"))
 
-    # индекс по вектору (если ещё не создан)
     if not any(idx.field_name == "embedding" for idx in collection.indexes):
         collection.create_index(
             field_name="embedding",
@@ -74,25 +71,41 @@ def get_or_create_collection() -> Collection:
                 "params": {"nlist": 256},
             },
         )
-
     collection.load()
     return collection
 
-# ───────────────────── Вспомогательные функции ───────────────────
+# ─────────────────────── Вспомогательные функции ───────────────────────
 
 def normalize(vec: list[float]) -> list[float]:
     arr = np.asarray(vec, dtype=np.float32)
-    norm = np.linalg.norm(arr)
-    return (arr / norm).tolist() if norm else arr.tolist()
+    return (arr / np.linalg.norm(arr)).tolist()
 
-# ───────────────────── Асинхронные утилиты ───────────────────────
+# Блокирующие вызовы Milvus в пуле потоков
+
+def uid_exists_sync(collection: Collection, uid: int) -> bool:
+    try:
+        res = collection.query(expr=f"id == {uid}", output_fields=["id"])
+        return bool(res)
+    except Exception:
+        return True
+
+def is_duplicate_vec_sync(collection: Collection, vector: list[float], threshold: float) -> bool:
+    search_params = {"metric_type": "IP", "params": {"nprobe": 32}}
+    res = collection.search(
+        data=[vector], anns_field="embedding", param=search_params,
+        limit=1, output_fields=["id"],
+    )
+    return bool(res and res[0] and res[0][0].score >= (1 - threshold))
+
+# ─────────────────────── I/O helpers ───────────────────────
 
 async def load_data() -> list[dict]:
     async with aiofiles.open(INPUT_PATH, "r", encoding="utf-8") as f:
-        return json.loads(await f.read())[:2000]
+        return json.loads(await f.read())[:10000]
 
 async def fetch_with_retry(session: aiohttp.ClientSession, url: str, payload: dict,
-                           max_retries: int = MAX_RETRIES, base_timeout: int = BASE_TIMEOUT_SEC):
+                           max_retries: int = MAX_RETRIES,
+                           base_timeout: int = BASE_TIMEOUT_SEC):
     for attempt in range(1, max_retries + 1):
         try:
             async with session.post(url, json=payload, timeout=base_timeout) as resp:
@@ -103,90 +116,101 @@ async def fetch_with_retry(session: aiohttp.ClientSession, url: str, payload: di
                 raise
             await asyncio.sleep(2 ** (attempt - 1))
 
-async def get_embedding_text(session: aiohttp.ClientSession, text: str):
-    data = await fetch_with_retry(session, EMBEDDING_TEXT_URL, {"text": text})
-    return data["embedding_text"]
+# ─────────────────────── Обработка одного параграфа ───────────────────────
 
-async def get_embedding(session: aiohttp.ClientSession, text: str):
-    data = await fetch_with_retry(session, EMBEDDING_URL, {"text": text})
-    return data["embedding"]
+async def process_item(item: dict,
+                       collection: Collection,
+                       session: aiohttp.ClientSession,
+                       stats: dict[str, int],
+                       log_lock: asyncio.Lock,
+                       log_file: Any,
+                       sem: asyncio.Semaphore,
+                       pbar: tqdm):
 
-# ─────────────────────── Короутина обработки ──────────────────────
-
-async def process_item(item: dict, *, collection: Collection, session: aiohttp.ClientSession,
-                       buf: dict, buf_lock: asyncio.Lock, sem: asyncio.Semaphore, stats: dict):
     async with sem:
         uid    = int(item.get("uid"))
-        pageid = int(item.get("ru_wiki_pageid", 0))
+        pageid = int(item.get("ru_wiki_pageid"))
         text   = item.get("text", "")
 
         if len(text) < MIN_TEXT_LENGTH:
             stats["too_short"] += 1
+            async with log_lock:
+                await log_file.write(f"TOO_SHORT: uid={uid}, pageid={pageid}\n")
+            pbar.update(1)
+            return
+
+        loop = asyncio.get_running_loop()
+
+        exists = await loop.run_in_executor(None, partial(uid_exists_sync, collection, uid))
+        if exists:
+            stats["dup_uid"] += 1
+            async with log_lock:
+                await log_file.write(f"UID_DUP: uid={uid}\n")
+            pbar.update(1)
             return
 
         try:
-            clean_text = await get_embedding_text(session, text)
-            emb_vec    = normalize(await get_embedding(session, clean_text))
-        except Exception:
+            clean_json = await fetch_with_retry(session, EMBEDDING_TEXT_URL, {"text": text})
+            clean_text = clean_json["embedding_text"]
+
+            emb_json = await fetch_with_retry(session, EMBEDDING_URL, {"text": clean_text})
+            emb_vec  = normalize(emb_json["embedding"])
+
+            dup_vec = await loop.run_in_executor(
+                None,
+                partial(is_duplicate_vec_sync, collection, emb_vec, SIMILARITY_THRESHOLD),
+            )
+            if dup_vec:
+                stats["dup_vec"] += 1
+                async with log_lock:
+                    await log_file.write(f"VEC_DUP: uid={uid}\n")
+                pbar.update(1)
+                return
+
+            await loop.run_in_executor(
+                None,
+                partial(collection.insert, [[uid], [pageid], [text], [clean_text], [emb_vec]]),
+            )
+            stats["inserted"] += 1
+
+        except Exception as exc:
             stats["errors"] += 1
-            return
+            async with log_lock:
+                await log_file.write(f"ERROR: uid={uid}, err={repr(exc)}\n")
 
-        # Буферизуем вставку
-        async with buf_lock:
-            buf["id"].append(uid)
-            buf["ru_wiki_pageid"].append(pageid)
-            buf["text"].append(text)
-            buf["embedding_text"].append(clean_text)
-            buf["embedding"].append(emb_vec)
+        pbar.update(1)
 
-            if len(buf["id"]) >= BATCH_SIZE:
-                try:
-                    collection.insert([buf["id"], buf["ru_wiki_pageid"], buf["text"], buf["embedding_text"], buf["embedding"]])
-                    stats["inserted"] += len(buf["id"])
-                except milvus_exc.InsertException as exc:
-                    # Выделяем количество дублей из сообщения об ошибке, иначе считаем все PK дубликатами
-                    dup = len(buf["id"])
-                    stats["dup_uid"] += dup
-                finally:
-                    for k in buf:
-                        buf[k].clear()
+# ─────────────────────── Главная функция ───────────────────────
 
-# ─────────────────────────── main() ───────────────────────────────
-
-async def main_index():
+async def main_index_multi():
     data       = await load_data()
     collection = get_or_create_collection()
-    sem        = asyncio.Semaphore(MAX_CONCURRENT)
-    buf_lock   = asyncio.Lock()
-    buf        = {k: [] for k in ("id", "ru_wiki_pageid", "text", "embedding_text", "embedding")}
-    stats      = {k: 0 for k in ("inserted", "dup_uid", "errors", "too_short")}
+    stats      = {k: 0 for k in ("inserted", "dup_uid", "dup_vec", "errors", "too_short")}
 
-    async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=MAX_CONCURRENT)) as session:
-        tasks = [asyncio.create_task(process_item(it, collection=collection, session=session,
-                                                  buf=buf, buf_lock=buf_lock, sem=sem, stats=stats))
-                 for it in data]
+    sem       = asyncio.Semaphore(MAX_CONCURRENCY)
+    log_lock  = asyncio.Lock()
 
-        for fut in tqdm(asyncio.as_completed(tasks), total=len(tasks), desc="Индексация", ncols=100):
-            await fut
-            # Периодически печатаем текущую статистику
-            if (stats["inserted"] + stats["dup_uid"] + stats["errors"] + stats["too_short"]) % 500 == 0:
-                tqdm.write(
-                    f"inserted:{stats['inserted']} dup_uid:{stats['dup_uid']} "
-                    f"err:{stats['errors']} short:{stats['too_short']}")
+    async with aiofiles.open(LOG_DUPLICATES, "w", encoding="utf-8") as log_file, \
+               aiohttp.ClientSession(connector=aiohttp.TCPConnector(limit=MAX_CONCURRENCY)) as session:
 
-    # Финальный слив буфера
-    if buf["id"]:
+        pbar = tqdm(total=len(data), desc="Индексация", ncols=100)
         try:
-            collection.insert([buf["id"], buf["ru_wiki_pageid"], buf["text"], buf["embedding_text"], buf["embedding"]])
-            stats["inserted"] += len(buf["id"])
-        except milvus_exc.InsertException:
-            stats["dup_uid"] += len(buf["id"])
+            tasks = [
+                asyncio.create_task(
+                    process_item(item, collection, session, stats, log_lock, log_file, sem, pbar)
+                )
+                for item in data
+            ]
+            await asyncio.gather(*tasks)
+        finally:
+            pbar.close()
 
     collection.flush(); collection.load()
+
     print(
         f"Всего {len(data)} → inserted {stats['inserted']} dup_uid {stats['dup_uid']} "
-        f"errors {stats['errors']} short {stats['too_short']}"
+        f"dup_vec {stats['dup_vec']} errors {stats['errors']} short {stats['too_short']}"
     )
 
 if __name__ == "__main__":
-    asyncio.run(main_index())
+    asyncio.run(main_index_multi())
