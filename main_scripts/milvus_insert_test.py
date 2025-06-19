@@ -12,7 +12,7 @@ from pathlib import Path
 from tqdm import tqdm
 
 # -------------------------------------------------------------
-API_URL    = "http://127.0.0.1:8500/insert_item"  # ← change host/port if necessary
+API_URL    = "http://0.0.0.0:8500/insert_item"  # ← change host/port if necessary
 INPUT_PATH = Path("data/RuBQ_2.0_paragraphs.json")
 LOG_FILE   = "index_duplicates.log"
 TIMEOUT    = aiohttp.ClientTimeout(total=30)
@@ -51,7 +51,7 @@ async def run_test(start: int, end: int):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Test driver for /insert_item")
     parser.add_argument("--start", type=int, default=100, help="Start index (inclusive)")
-    parser.add_argument("--end", type=int, default=110, help="End index (exclusive)")
+    parser.add_argument("--end", type=int, default=300, help="End index (exclusive)")
     args = parser.parse_args()
 
     try:

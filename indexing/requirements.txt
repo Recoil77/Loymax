@@ -1,0 +1,11 @@
+fastapi
+uvicorn[standard]
+python-dotenv
+aiohttp
+pydantic
+openai>=1.0.0
+torch
+transformers
+pymilvus
+numpy
+aiofiles

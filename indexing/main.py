@@ -8,8 +8,60 @@ import asyncio
 import torch
 from concurrent.futures import ThreadPoolExecutor
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
+from fastapi import APIRouter, FastAPI, HTTPException
+from pydantic import BaseModel, Field
+import aiohttp, aiofiles, asyncio, numpy as np
+from functools import partial
+from typing import Any, Dict, Literal
+
+from pymilvus import (
+    connections,
+    Collection,
+    CollectionSchema,
+    FieldSchema,
+    DataType,
+    list_collections,
+)
+import os
+import asyncio
+from typing import List, Dict, AsyncIterator
+
+import aiohttp
+import numpy as np
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from pymilvus import connections, Collection
+
+
 load_dotenv()
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
+
+EMBEDDING_TEXT_URL =    os.getenv("EMBEDDING_TEXT_URL", "http://fastapi-embeddings:8500/embedding_text")
+EMBEDDING_URL =         os.getenv("EMBEDDING_URL",      "http://fastapi-embeddings:8500/embedding")
+RERANK_BGE_URL =        os.getenv("RERANK_BGE_URL",     "http://fastapi-embeddings:8500/rerank_bge")
+RERANK_SEMANTIC_URL =   os.getenv("RERANK_SEMANTIC_URL","http://fastapi-embeddings:8500/rerank_semantic")
+ASSEMBLE_DOCUMENT_URL = os.getenv("ASSEMBLE_DOCUMENT",  "http://fastapi-embeddings:8500/assemble_document")
+
+MILVUS_HOST = os.getenv("MILVUS_HOST", "192.168.168.10")
+MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "wiki_paragraphs")
+
+
+###############################################################################
+# ───────────────────────────────  SETTINGS  ──────────────────────────────── #
+###############################################################################
+
+
+LOG_DUPLICATES       = "index_duplicates.log"
+SIMILARITY_THRESHOLD = 0.02
+EMBEDDING_DIM        = 3072
+MIN_TEXT_LENGTH      = 20
+MAX_RETRIES          = 3
+BASE_TIMEOUT_SEC     = 30
+MAX_LLM_BLOCKS = int(os.getenv("MAX_LLM_BLOCKS", 8))
+THRESHOLD = float(os.getenv("RERANK_THRESHOLD", 0.1))
 
 app = FastAPI()
 client = openai.AsyncOpenAI(api_key=OPENAI_API_KEY)
@@ -335,17 +387,7 @@ async def assemble_document(request: AssembleDocumentRequest):
         return {"assembled_document": f"Error: {str(e)}"}
 
 
-import os
-import asyncio
-from typing import List, Dict, AsyncIterator
 
-import aiohttp
-import numpy as np
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from pymilvus import connections, Collection
 
 
 class QueryRequest(BaseModel):
@@ -354,19 +396,7 @@ class QueryRequest(BaseModel):
 
 
 
-# ---------------------------------------------------------------------------
-# ENVIRONMENT
-# ---------------------------------------------------------------------------
-EMBEDDING_TEXT_URL = os.getenv("EMBEDDING_TEXT_URL", "http://192.168.168.10:8500/embedding_text")
-EMBEDDING_URL = os.getenv("EMBEDDING_URL", "http://192.168.168.10:8500/embedding")
-MILVUS_HOST = os.getenv("MILVUS_HOST", "192.168.168.11")
-MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
-COLLECTION_NAME = os.getenv("COLLECTION_NAME", "wiki_paragraphs")
-RERANK_BGE_URL = os.getenv("RERANK_BGE_URL", "http://192.168.168.10:8500/rerank_bge")
-RERANK_SEMANTIC_URL = os.getenv("RERANK_SEMANTIC_URL", "http://192.168.168.10:8500/rerank_semantic")
-ASSEMBLE_DOCUMENT_URL = os.getenv("ASSEMBLE_DOCUMENT", "http://192.168.168.10:8500/assemble_document")
-MAX_LLM_BLOCKS = int(os.getenv("MAX_LLM_BLOCKS", 8))
-THRESHOLD = float(os.getenv("RERANK_THRESHOLD", 0.1))
+
 
 # ---------------------------------------------------------------------------
 # HELPERS
@@ -501,41 +531,9 @@ async def process_query(request: QueryRequest):
 
 
 
-###############################################################################
-# ───────────────────────────────  SETTINGS  ──────────────────────────────── #
-###############################################################################
 
-EMBEDDING_TEXT_URL   = "http://192.168.168.10:8500/embedding_text"
-EMBEDDING_URL        = "http://192.168.168.10:8500/embedding"
-LOG_DUPLICATES       = "index_duplicates.log"
-SIMILARITY_THRESHOLD = 0.02
-EMBEDDING_DIM        = 3072
-MIN_TEXT_LENGTH      = 20
-MAX_RETRIES          = 3
-BASE_TIMEOUT_SEC     = 30
 
-MILVUS_HOST          = "192.168.168.10"
-MILVUS_PORT          = "19530"
-COLLECTION_NAME      = "wiki_paragraphs"
 
-###############################################################################
-# ──────────────────────────────  DEPENDENCIES  ───────────────────────────── #
-###############################################################################
-
-from fastapi import APIRouter, FastAPI, HTTPException
-from pydantic import BaseModel, Field
-import aiohttp, aiofiles, asyncio, numpy as np
-from functools import partial
-from typing import Any, Dict, Literal
-
-from pymilvus import (
-    connections,
-    Collection,
-    CollectionSchema,
-    FieldSchema,
-    DataType,
-    list_collections,
-)
 
 ###############################################################################
 # ────────────────────────────  MILVUS HELPERS  ───────────────────────────── #
