@@ -333,3 +333,343 @@ async def assemble_document(request: AssembleDocumentRequest):
 
     except Exception as e:
         return {"assembled_document": f"Error: {str(e)}"}
+
+
+import os
+import asyncio
+from typing import List, Dict, AsyncIterator
+
+import aiohttp
+import numpy as np
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel
+from pymilvus import connections, Collection
+
+
+class QueryRequest(BaseModel):
+    question: str
+    k: int = 8
+
+
+
+# ---------------------------------------------------------------------------
+# ENVIRONMENT
+# ---------------------------------------------------------------------------
+EMBEDDING_TEXT_URL = os.getenv("EMBEDDING_TEXT_URL", "http://192.168.168.10:8500/embedding_text")
+EMBEDDING_URL = os.getenv("EMBEDDING_URL", "http://192.168.168.10:8500/embedding")
+MILVUS_HOST = os.getenv("MILVUS_HOST", "192.168.168.11")
+MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
+COLLECTION_NAME = os.getenv("COLLECTION_NAME", "wiki_paragraphs")
+RERANK_BGE_URL = os.getenv("RERANK_BGE_URL", "http://192.168.168.10:8500/rerank_bge")
+RERANK_SEMANTIC_URL = os.getenv("RERANK_SEMANTIC_URL", "http://192.168.168.10:8500/rerank_semantic")
+ASSEMBLE_DOCUMENT_URL = os.getenv("ASSEMBLE_DOCUMENT", "http://192.168.168.10:8500/assemble_document")
+MAX_LLM_BLOCKS = int(os.getenv("MAX_LLM_BLOCKS", 8))
+THRESHOLD = float(os.getenv("RERANK_THRESHOLD", 0.1))
+
+# ---------------------------------------------------------------------------
+# HELPERS
+# ---------------------------------------------------------------------------
+
+def normalize(v: List[float]) -> List[float]:
+    arr = np.asarray(v, dtype=np.float32)
+    return (arr / np.linalg.norm(arr)).tolist()
+
+
+async def get_embedding_text(text: str) -> str:
+    async with aiohttp.ClientSession() as session:
+        async with session.post(EMBEDDING_TEXT_URL, json={"text": text}) as resp:
+            resp.raise_for_status()
+            return (await resp.json())["embedding_text"]
+
+
+async def embed(text: str) -> List[float]:
+    async with aiohttp.ClientSession() as session:
+        # 1. Clean / translate text
+        async with session.post(EMBEDDING_TEXT_URL, json={"text": text}) as resp:
+            resp.raise_for_status()
+            clean = (await resp.json())["embedding_text"]
+
+        # 2. Get embedding
+        async with session.post(EMBEDDING_URL, json={"text": clean}) as resp:
+            resp.raise_for_status()
+            vec = (await resp.json())["embedding"]
+
+    return normalize(vec)
+
+
+def search_milvus(vec: List[float], k: int):
+    """Blocking call → executed in threadpool via asyncio.to_thread"""
+    connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
+    col = Collection(COLLECTION_NAME)
+    col.load()
+
+    params = {"metric_type": "IP", "params": {"nprobe": 32}}
+    hits = col.search([vec], "embedding", params, limit=k,
+                      output_fields=["id", "ru_wiki_pageid", "text", "embedding_text"],
+                      consistency_level="Strong")[0]
+
+    candidates = [
+        {
+            "id": h.entity.id,
+            "text": h.entity.text,
+            "embedding_text": getattr(h.entity, "embedding_text", "")
+        }
+        for h in hits
+    ]
+    return candidates
+
+
+async def rerank_bge(question: str, answers: List[str], threshold: float = THRESHOLD):
+    payload = {"question": question, "answers": answers, "threshold": threshold}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(RERANK_BGE_URL, json=payload) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+
+async def rerank_semantic(question: str, candidates: List[Dict], threshold: float = THRESHOLD):
+    payload = {"question": question, "candidates": candidates, "threshold": threshold}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(RERANK_SEMANTIC_URL, json=payload) as resp:
+            resp.raise_for_status()
+            return await resp.json()
+
+
+async def assemble_document(question: str, blocks: List[str]) -> str:
+    payload = {"question": question, "chunks": blocks}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(ASSEMBLE_DOCUMENT_URL, json=payload) as resp:
+            resp.raise_for_status()
+            data = await resp.json()
+            return data.get("assembled_document", "")
+
+# ---------------------------------------------------------------------------
+# FASTAPI APP
+# ---------------------------------------------------------------------------
+
+
+
+
+@app.post("/process_query")
+async def process_query(request: QueryRequest):
+    async def event_stream() -> AsyncIterator[str]:
+        try:
+            # 1️⃣ Clean question
+            yield f"=== START RETRIEVAL: '{request.question}' ===\n"
+            query_embedding_text = await get_embedding_text(request.question)
+            yield f"[step] Очищенный текст запроса:\n{query_embedding_text[:150]}\n{'-'*40}\n"
+
+            # 2️⃣ Vectorize
+            vec = await embed(request.question)
+            
+            # 3️⃣ Milvus search (run in thread)
+            candidates = await asyncio.to_thread(search_milvus, vec, request.k)
+            yield f"\n[step] TOP-{request.k} Кандидатов из Milvus (embedding_text):\n"
+            for i, c in enumerate(candidates):
+                yield f"[{i}] {c['embedding_text'][:150]} ...\n"
+
+            # 4️⃣ BGE rerank
+            bge_result = await rerank_bge(query_embedding_text, [c["embedding_text"] for c in candidates], threshold=-5)
+            top_bge = bge_result["results"][:MAX_LLM_BLOCKS]
+            yield f"\n[step] TOP-{MAX_LLM_BLOCKS} после BGE rerank (embedding_text):\n"
+            for r in top_bge:
+                snippet = r['text'][:150]
+                yield f"score={r['score']:.3f} idx={r['index']}: {snippet} ...\n"
+
+            # 5️⃣ LLM semantic rerank
+            top_indices = [r["index"] for r in top_bge]
+            semantic_candidates = [{"block_id": candidates[i]["id"], "text": candidates[i]["text"]} for i in top_indices]
+            semantic_result = await rerank_semantic(request.question, semantic_candidates, threshold=THRESHOLD)
+            semantic_sorted = sorted(semantic_result, key=lambda r: r["score"], reverse=True)
+            yield "\n[step] Блоки после LLM rerank (отсортировано по score):\n"
+            for r in semantic_sorted:
+                text = next(c["text"] for c in semantic_candidates if c["block_id"] == r["block_id"])
+                yield f"score={r['score']:.3f} id={r['block_id']}\n{text[:150]} ...\n"
+
+            # 6️⃣ Assemble document
+            top_blocks = [next(c["text"] for c in semantic_candidates if c["block_id"] == r["block_id"]) for r in semantic_sorted]
+            assembled = await assemble_document(request.question, top_blocks)
+            yield "\n=== Финальный сгенерированный ответ ===\n"
+            yield assembled + "\n"
+        except Exception as exc:
+            # Surface errors to client
+            yield f"ERROR: {exc}\n"
+
+    return StreamingResponse(event_stream(), media_type="text/plain")
+
+
+
+###############################################################################
+# ───────────────────────────────  SETTINGS  ──────────────────────────────── #
+###############################################################################
+
+EMBEDDING_TEXT_URL   = "http://192.168.168.10:8500/embedding_text"
+EMBEDDING_URL        = "http://192.168.168.10:8500/embedding"
+LOG_DUPLICATES       = "index_duplicates.log"
+SIMILARITY_THRESHOLD = 0.02
+EMBEDDING_DIM        = 3072
+MIN_TEXT_LENGTH      = 20
+MAX_RETRIES          = 3
+BASE_TIMEOUT_SEC     = 30
+
+MILVUS_HOST          = "192.168.168.10"
+MILVUS_PORT          = "19530"
+COLLECTION_NAME      = "wiki_paragraphs"
+
+###############################################################################
+# ──────────────────────────────  DEPENDENCIES  ───────────────────────────── #
+###############################################################################
+
+from fastapi import APIRouter, FastAPI, HTTPException
+from pydantic import BaseModel, Field
+import aiohttp, aiofiles, asyncio, numpy as np
+from functools import partial
+from typing import Any, Dict, Literal
+
+from pymilvus import (
+    connections,
+    Collection,
+    CollectionSchema,
+    FieldSchema,
+    DataType,
+    list_collections,
+)
+
+###############################################################################
+# ────────────────────────────  MILVUS HELPERS  ───────────────────────────── #
+###############################################################################
+
+def _get_or_create_collection() -> Collection:
+    connections.connect(alias="default", host=MILVUS_HOST, port=MILVUS_PORT)
+
+    if COLLECTION_NAME in list_collections():
+        coll = Collection(COLLECTION_NAME)
+    else:
+        fields = [
+            FieldSchema(name="id", dtype=DataType.INT64, is_primary=True, auto_id=False),
+            FieldSchema(name="ru_wiki_pageid", dtype=DataType.INT64),
+            FieldSchema(name="text", dtype=DataType.VARCHAR, max_length=8192 * 2),
+            FieldSchema(name="embedding_text", dtype=DataType.VARCHAR, max_length=8192 * 2),
+            FieldSchema(name="embedding", dtype=DataType.FLOAT_VECTOR, dim=EMBEDDING_DIM),
+        ]
+        coll = Collection(COLLECTION_NAME, CollectionSchema(fields, "Wiki paragraphs (ru)"))
+
+    if not any(idx.field_name == "embedding" for idx in coll.indexes):
+        coll.create_index(
+            field_name="embedding",
+            index_params={
+                "index_type": "IVF_FLAT",
+                "metric_type": "IP",
+                "params": {"nlist": 256},
+            },
+        )
+    coll.load()
+    return coll
+
+collection: Collection = _get_or_create_collection()
+loop = asyncio.get_event_loop()
+
+###############################################################################
+# ─────────────────────────────  UTILITIES  ───────────────────────────────── #
+###############################################################################
+
+def normalize(vec: list[float]) -> list[float]:
+    arr = np.asarray(vec, dtype=np.float32)
+    return (arr / np.linalg.norm(arr)).tolist()
+
+async def fetch_with_retry(
+    session: aiohttp.ClientSession,
+    url: str,
+    payload: Dict[str, Any],
+    max_retries: int = MAX_RETRIES,
+    base_timeout: int = BASE_TIMEOUT_SEC,
+):
+    """POST `payload` and return `await resp.json()` with exponential back‑off."""
+    for attempt in range(1, max_retries + 1):
+        try:
+            async with session.post(url, json=payload, timeout=base_timeout) as resp:
+                resp.raise_for_status()
+                return await resp.json()
+        except (aiohttp.ClientError, asyncio.TimeoutError):
+            if attempt == max_retries:
+                raise
+            await asyncio.sleep(2 ** (attempt - 1))
+
+# Thread‑pool wrappers for Milvus calls -------------------------------------------------
+
+def _uid_exists(uid: int) -> bool:
+    try:
+        return bool(collection.query(expr=f"id == {uid}", output_fields=["id"]))
+    except Exception:
+        return True
+
+def _is_duplicate_vec(vec: list[float]) -> bool:
+    search_params = {"metric_type": "IP", "params": {"nprobe": 32}}
+    res = collection.search([vec], anns_field="embedding", param=search_params, limit=1, output_fields=["id"])
+    return bool(res and res[0] and res[0][0].score >= (1 - SIMILARITY_THRESHOLD))
+
+async def _log(kind: str, uid: int, msg: str | None = None):
+    async with aiofiles.open(LOG_DUPLICATES, "a", encoding="utf-8") as f:
+        await f.write(f"{kind.upper()}: uid={uid}" + (f" | {msg}" if msg else "") + "\n")
+
+###############################################################################
+# ─────────────────────────────  DATA MODELS  ─────────────────────────────── #
+###############################################################################
+
+class Paragraph(BaseModel):
+    uid: int = Field(..., gt=0)
+    ru_wiki_pageid: int = Field(..., gt=0)
+    text: str
+
+class InsertResponse(BaseModel):
+    success: bool
+    reason: Literal[
+        "inserted",
+        "uid_duplicate",
+        "vector_duplicate",
+        "too_short",
+        "internal_error",
+    ]
+
+###############################################################################
+# ────────────────────────────────  ROUTER  ───────────────────────────────── #
+###############################################################################
+
+@app.post("/insert_item", response_model=InsertResponse)
+async def insert_item(item: Paragraph):
+    # ----------- 1. длина текста -----------
+    if len(item.text) < MIN_TEXT_LENGTH:
+        await _log("too_short", item.uid)
+        return InsertResponse(success=False, reason="too_short")
+
+    # ----------- 2. дубликат UID -----------
+    if await loop.run_in_executor(None, partial(_uid_exists, item.uid)):
+        await _log("uid_dup", item.uid)
+        return InsertResponse(success=False, reason="uid_duplicate")
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            # --- 3. очищенный текст + embedding ---
+            clean_json = await fetch_with_retry(session, EMBEDDING_TEXT_URL, {"text": item.text})
+            clean_text = clean_json["embedding_text"]
+
+            emb_json  = await fetch_with_retry(session, EMBEDDING_URL, {"text": clean_text})
+            emb_vec   = normalize(emb_json["embedding"])
+
+        # ----------- 4. дубликат по вектору -----------
+        if await loop.run_in_executor(None, partial(_is_duplicate_vec, emb_vec)):
+            await _log("vec_dup", item.uid)
+            return InsertResponse(success=False, reason="vector_duplicate")
+
+        # ----------- 5. вставка -----------
+        await loop.run_in_executor(
+            None,
+            partial(collection.insert, [[item.uid], [item.ru_wiki_pageid], [item.text], [clean_text], [emb_vec]]),
+        )
+        return InsertResponse(success=True, reason="inserted")
+
+    except Exception as exc:
+        await _log("error", item.uid, repr(exc))
+        raise HTTPException(status_code=500, detail="internal_error")

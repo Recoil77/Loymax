@@ -34,7 +34,7 @@ load_dotenv()
 EMBEDDING_TEXT_URL     = os.getenv("EMBEDDING_TEXT_URL", "http://192.168.168.10:8500/embedding_text")
 EMBEDDING_URL          = os.getenv("EMBEDDING_URL",      "http://192.168.168.10:8500/embedding")
 INPUT_PATH             = Path(os.getenv("INPUT_PATH",    "data/RuBQ_2.0_paragraphs.json"))
-MILVUS_HOST            = os.getenv("MILVUS_HOST",        "192.168.168.11")
+MILVUS_HOST            = os.getenv("MILVUS_HOST",        "192.168.168.10")
 MILVUS_PORT            = os.getenv("MILVUS_PORT",        "19530")
 COLLECTION_NAME        = os.getenv("COLLECTION_NAME",    "wiki_paragraphs")
 LOG_DUPLICATES         = os.getenv("LOG_DUPLICATES",     "index_duplicates.log")
@@ -101,7 +101,7 @@ def is_duplicate_vec_sync(collection: Collection, vector: list[float], threshold
 
 async def load_data() -> list[dict]:
     async with aiofiles.open(INPUT_PATH, "r", encoding="utf-8") as f:
-        return json.loads(await f.read())[:10000]
+        return json.loads(await f.read())[:100]
 
 async def fetch_with_retry(session: aiohttp.ClientSession, url: str, payload: dict,
                            max_retries: int = MAX_RETRIES,
