@@ -1,0 +1,19 @@
+1. What for normalizing vectors ?
+2. Really  BGE eat only first 512 chars ?
+3. Research BGE input format
+4. Rewrite prompt from LLM semantic reranker (delete threshold)
+5. Cut doc to 512 char chunks (symantic chunker ? )
+6. Choose library config and integrate for all projects
+
+
+Create endpoint to send json block to databse
+Create endpoint to retrieve answer using query (full pipeline in stream mode)
+
+Choosing databse (pgvecor or milvus) without priority
+One docker-compose file with all services + script that call fast api retrieve endpoint
+
+my chunks in Amazon project are 3000  one of six info loosing in BGE reranking
+And need check Phuket ai chunk size (about 512 tokens)
+
+Always save main question doc, for offline working
+
