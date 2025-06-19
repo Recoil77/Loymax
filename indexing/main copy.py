@@ -16,7 +16,7 @@ from pydantic import BaseModel, Field
 import openai
 
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from pymilvus.exceptions import MilvusException  
+
 from pymilvus import (
     connections,
     Collection,
@@ -627,39 +627,39 @@ class InsertResponse(BaseModel):
 # ────────────────────────────────  ROUTER  ───────────────────────────────── #
 ###############################################################################
 
-
-
 @app.post("/insert_item", response_model=InsertResponse)
 async def insert_item(item: Paragraph):
+    # ----------- 1. длина текста -----------
     if len(item.text) < MIN_TEXT_LENGTH:
+        await _log("too_short", item.uid)
         return InsertResponse(success=False, reason="too_short")
 
+    # ----------- 2. дубликат UID -----------
     if await loop.run_in_executor(None, partial(_uid_exists, item.uid)):
+        await _log("uid_dup", item.uid)
         return InsertResponse(success=False, reason="uid_duplicate")
 
     try:
         async with aiohttp.ClientSession() as session:
+            # --- 3. очищенный текст + embedding ---
             clean_json = await fetch_with_retry(session, EMBEDDING_TEXT_URL, {"text": item.text})
             clean_text = clean_json["embedding_text"]
 
             emb_json  = await fetch_with_retry(session, EMBEDDING_URL, {"text": clean_text})
             emb_vec   = normalize(emb_json["embedding"])
 
+        # ----------- 4. дубликат по вектору -----------
         if await loop.run_in_executor(None, partial(_is_duplicate_vec, emb_vec)):
+            await _log("vec_dup", item.uid)
             return InsertResponse(success=False, reason="vector_duplicate")
 
-        try:
-            await loop.run_in_executor(
-                None,
-                partial(collection.insert, [[item.uid], [item.ru_wiki_pageid], [item.text], [clean_text], [emb_vec]]),
-            )
-        except MilvusException as milvus_exc:
-            if "primary key" in str(milvus_exc).lower():
-                return InsertResponse(success=False, reason="uid_duplicate")
-            else:
-                raise HTTPException(status_code=500, detail="milvus_error")
-
+        # ----------- 5. вставка -----------
+        await loop.run_in_executor(
+            None,
+            partial(collection.insert, [[item.uid], [item.ru_wiki_pageid], [item.text], [clean_text], [emb_vec]]),
+        )
         return InsertResponse(success=True, reason="inserted")
 
     except Exception as exc:
+        await _log("error", item.uid, repr(exc))
         raise HTTPException(status_code=500, detail="internal_error")

@@ -194,6 +194,7 @@ cython_debug/
 .cursorindexingignore
 
 # Project data dir
-/data
-/volumes
+data/
+volumes/
+archive/
 

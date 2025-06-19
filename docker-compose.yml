@@ -76,17 +76,17 @@ services:
 
   fastapi-embeddings:
     build:
-      context: ./indexing           # <-- Папка, где Dockerfile
+      context: ./indexing           
     container_name: fastapi-embeddings
     restart: unless-stopped
     env_file:
-      - ./indexing/.env             # <-- Используй свой .env для переменных
+      - ./indexing/.env            
     ports:
       - "8500:8500"
     environment:
       MILVUS_HOST: standalone
       MILVUS_PORT: 19530
-      # другие переменные по необходимости (можно и через .env)
+      
     depends_on:
       - "standalone"
     networks:
