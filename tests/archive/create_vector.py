@@ -2,7 +2,7 @@ import asyncio
 from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy import text
 
-DATABASE_URL = "postgresql+asyncpg://postgres:Recoil_post_2002#@db-dev.fullnode.pro/loymax"
+DATABASE_URL = os.getenv("DATABASE_URL_ASYNC")
 
 async def enable_pgvector():
     engine = create_async_engine(DATABASE_URL, echo=True)

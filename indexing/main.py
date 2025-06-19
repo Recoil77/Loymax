@@ -1,18 +1,21 @@
 import os
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from dotenv import load_dotenv
-import openai
 import json
 import asyncio
-import torch
-from concurrent.futures import ThreadPoolExecutor
-from transformers import AutoTokenizer, AutoModelForSequenceClassification
-from fastapi import APIRouter, FastAPI, HTTPException
-from pydantic import BaseModel, Field
-import aiohttp, aiofiles, asyncio, numpy as np
 from functools import partial
-from typing import Any, Dict, Literal
+from concurrent.futures import ThreadPoolExecutor
+from typing import Any, Dict, List, Literal, AsyncIterator
+
+import numpy as np
+import aiohttp
+import aiofiles
+import torch
+from dotenv import load_dotenv
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import StreamingResponse
+from pydantic import BaseModel, Field
+import openai
+
+from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
 from pymilvus import (
     connections,
@@ -22,17 +25,6 @@ from pymilvus import (
     DataType,
     list_collections,
 )
-import os
-import asyncio
-from typing import List, Dict, AsyncIterator
-
-import aiohttp
-import numpy as np
-from dotenv import load_dotenv
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
-from pymilvus import connections, Collection
 
 
 load_dotenv()
@@ -44,7 +36,7 @@ RERANK_BGE_URL =        os.getenv("RERANK_BGE_URL",     "http://fastapi-embeddin
 RERANK_SEMANTIC_URL =   os.getenv("RERANK_SEMANTIC_URL","http://fastapi-embeddings:8500/rerank_semantic")
 ASSEMBLE_DOCUMENT_URL = os.getenv("ASSEMBLE_DOCUMENT",  "http://fastapi-embeddings:8500/assemble_document")
 
-MILVUS_HOST = os.getenv("MILVUS_HOST", "192.168.168.10")
+MILVUS_HOST = os.getenv("MILVUS_HOST", "standalone")
 MILVUS_PORT = os.getenv("MILVUS_PORT", "19530")
 COLLECTION_NAME = os.getenv("COLLECTION_NAME", "wiki_paragraphs")
 
@@ -54,7 +46,7 @@ COLLECTION_NAME = os.getenv("COLLECTION_NAME", "wiki_paragraphs")
 ###############################################################################
 
 
-LOG_DUPLICATES       = "index_duplicates.log"
+LOG_DUPLICATES       = "log/index_duplicates.log"
 SIMILARITY_THRESHOLD = 0.02
 EMBEDDING_DIM        = 3072
 MIN_TEXT_LENGTH      = 20

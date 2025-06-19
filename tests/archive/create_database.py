@@ -4,7 +4,7 @@ from sqlalchemy.orm import declarative_base
 from sqlalchemy import Column, Integer, Text
 from pgvector.sqlalchemy import Vector
 
-DATABASE_URL = "postgresql+asyncpg://postgres:Recoil_post_2002#@db-dev.fullnode.pro/loymax"
+DATABASE_URL = os.getenv("DATABASE_URL_ASYNC")
 
 Base = declarative_base()
 
