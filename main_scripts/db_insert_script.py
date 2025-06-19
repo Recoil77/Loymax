@@ -51,7 +51,7 @@ async def run_test(start: int, end: int):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser("Test driver for /insert_item")
     parser.add_argument("--start", type=int, default=1, help="Start index (inclusive)")
-    parser.add_argument("--end", type=int, default=10, help="End index (exclusive)")
+    parser.add_argument("--end", type=int, default=15, help="End index (exclusive)")
     args = parser.parse_args()
 
     try:
