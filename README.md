@@ -1,57 +1,55 @@
 # Loymax Milvus Pipeline
 
-This project contains a collection of scripts for building and querying a Milvus
-vector database using OpenAI models. The repository is split into two main
-parts:
+Loymax is a collection of Python utilities for building a vector search service with [Milvus](https://milvus.io/) and OpenAI models. The repository contains a small FastAPI application for embeddings and a set of helper scripts for populating and querying a Milvus collection.
 
-* **indexing/** – tools for populating Milvus with paragraph data.
-* **tests/** – helper scripts for preparing a Postgres/Milvus instance and for
-  verifying embedding endpoints.
+## Directory overview
 
-## Indexing
+- **indexing/** – FastAPI service exposing text normalisation, embedding and reranking endpoints. The service writes data to a Milvus instance.
+- **main_scripts/** – client utilities for loading and fetching records from the service.
+- **tests/** – small scripts for creating databases and checking data quality.
 
-`send_data_to_database.py` performs asynchronous bulk indexing. It reads records
-from `data/RuBQ_2.0_paragraphs.json`, cleans the text via an OpenAI endpoint and
-stores both the original text and its embedding in Milvus. The script relies on
-the following environment variables (see the file for defaults):
+## Running with Docker
 
-```
-EMBEDDING_TEXT_URL  # HTTP endpoint that normalises text
-EMBEDDING_URL       # Endpoint returning the embedding vector
-INPUT_PATH          # Path to the JSON dataset
-MILVUS_HOST/MILVUS_PORT
-COLLECTION_NAME
+A `docker-compose.yml` file is provided for running Milvus together with the embedding service:
+
+```bash
+docker-compose up -d
 ```
 
-Running the script creates the collection (if it does not exist) and inserts all
-paragraphs. It uses `MAX_CONCURRENCY` workers to speed up indexing.
+This starts Milvus, MinIO, ETCD and the FastAPI service. The service listens on port `8500` by default. Environment variables for host names and ports can be adjusted in `indexing/.env` or passed directly when running Docker.
 
-Several retrieval utilities are provided (`retriever_milvus.py` and
-`retriever_milvus_v2.py`/`v3.py`). They take a query, embed it via the same
-endpoints and search the Milvus collection. Additional reranking of search
-results can be done via BGE or a semantic LLM service.
+## Local development
 
-`main.py` exposes these functions as a FastAPI application with the following
-endpoints:
+1. Install dependencies:
 
-```
-/embedding_text      – return a cleaned version of input text
-/embedding           – return the embedding vector
-/rerank_bge          – rerank using a BGE model
-/rerank_semantic     – rerank using an LLM
-/assemble_document   – combine retrieved chunks into a document
+```bash
+python -m venv .venv
+source .venv/bin/activate
+pip install -r indexing/requirements.txt
 ```
 
-Set `OPENAI_API_KEY` in the environment to use the OpenAI APIs.
+2. Start the FastAPI app:
 
-## Tests and utilities
+```bash
+python indexing/main.py
+```
 
-The `tests/` directory contains small scripts for creating databases and
-checking dataset quality. For example, `create_database.py` initialises a
-PostgreSQL table with `pgvector`, while `embedding_text_test_endpoint.py` sends
-sample requests to the embedding services.
+The app relies on several environment variables such as `MILVUS_HOST`, `EMBEDDING_URL` and `OPENAI_API_KEY`. Default values are defined inside `indexing/main.py`.
+
+## Indexing data
+
+Use `main_scripts/db_insert_script_concurrency.py` to insert records into Milvus. The script reads from `data/RuBQ_2.0_paragraphs.json` and sends the content to the `/insert_item` endpoint concurrently.
+
+```bash
+python main_scripts/db_insert_script_concurrency.py --start 0 --end 100
+```
+
+For a simple retrieval test, run `main_scripts/db_fetch_script.py` which streams the `/process_query` response.
+
+## Tests
+
+The `tests/` directory includes small utilities for verifying the embedding endpoints and for initialising a PostgreSQL database with `pgvector`.
 
 ## License
 
-This project is distributed under the terms of the GNU General Public License
-version&nbsp;3. See [LICENSE](LICENSE) for the full text.
+This project is distributed under the terms of the GNU General Public License version&nbsp;3. See [LICENSE](LICENSE) for the full text.
